@@ -31,13 +31,43 @@ struct OurLoopReduce : public LoopPass {
   static char ID; // Pass identification, replacement for typeid
   OurLoopReduce() : LoopPass(ID) {}
 
-  void mapVariables(Loop *L)
-  {
+  Value *stripToBase(Value *V) {
+    while (true) {
+      // Ako je neki cast (sext, zext, trunc, bitcast, itd.)
+      if (auto *Cast = dyn_cast<CastInst>(V)) {
+        V = Cast->getOperand(0);
+        continue;
+      }
+
+      // Ako je load, idi na pointer od kog load-uješ
+      if (auto *LI = dyn_cast<LoadInst>(V)) {
+        V = LI->getPointerOperand();
+        continue;
+      }
+
+      // Inače stani
+      break;
+    }
+    return V;
+  }
+
+  void mapVariables(Loop *L) {
     Function *F = L->getHeader()->getParent();
+
     for (BasicBlock &BB : *F) {
       for (Instruction &I : BB) {
-        if (isa<LoadInst>(&I)) {
-          VariablesMap[&I] = I.getOperand(0);
+
+        if (auto *LI = dyn_cast<LoadInst>(&I)) {
+          Value *Base = stripToBase(LI);
+          VariablesMap[&I] = Base;
+          continue;
+        }
+
+        if (auto *CI = dyn_cast<CastInst>(&I)) {
+          Value *Op = CI->getOperand(0);
+          Value *Base = stripToBase(Op);
+          VariablesMap[&I] = Base;
+          continue;
         }
       }
     }
