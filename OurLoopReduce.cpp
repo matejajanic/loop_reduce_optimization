@@ -88,39 +88,126 @@ struct OurLoopReduce : public LoopPass {
     return false;
   }
 
-  void reduce(Loop *L)
-  {
-    BasicBlock* Preheader = L->getLoopPreheader();
-    IRBuilder<> Builder(Preheader->getTerminator());
-    AllocaInst* Idx = Builder.CreateAlloca(Builder.getInt32Ty(), nullptr, "Idx");
-    Builder.CreateStore(LoopCounter, Idx);
+  void reduce(Loop *L) {
+    using namespace llvm;
 
-    BasicBlock * LoopBodyBB = LoopBasicBlocks[1]; // assuming there is only 1 BB
-    Value *Var1, *Var2;
+    BasicBlock *Preheader = L->getLoopPreheader();
+    BasicBlock *Header = L->getHeader();
+    BasicBlock *Latch = L->getLoopLatch();
 
-    for (Instruction &I : *LoopBodyBB) {
-      if (isa<MulOperator>(&I)) {
-        Var1 = VariablesMap[I.getOperand(0)];
-        Var2 = VariablesMap[I.getOperand(1)];
-
-
-      }
+    if (!Preheader || !Header || !Latch) {
+        errs() << "Loop shape unsupported!\n";
+        return;
     }
-  }
+
+    BasicBlock *BodyBB = nullptr;
+    for (BasicBlock *BB : L->getBlocks()) {
+        if (BB != Header && BB != Latch) {
+            BodyBB = BB;
+            break;
+        }
+    }
+    if (!BodyBB)
+        BodyBB = Header;
+
+    // finding the mul instruction
+    Instruction *MulInstFound = nullptr;
+    ConstantInt *ConstFound   = nullptr;
+
+    for (Instruction &I : *BodyBB) {
+        if (I.getOpcode() != Instruction::Mul)
+            continue;
+
+        Value *Op0 = I.getOperand(0);
+        Value *Op1 = I.getOperand(1);
+
+        if (VariablesMap.find(Op0) != VariablesMap.end())
+            Op0 = VariablesMap[Op0];
+        if (VariablesMap.find(Op1) != VariablesMap.end())
+            Op1 = VariablesMap[Op1];
+
+        if (Op0 == LoopCounter && isa<ConstantInt>(I.getOperand(1))) {
+            MulInstFound = &I;
+            ConstFound   = cast<ConstantInt>(I.getOperand(1));
+            break;
+        }
+        if (Op1 == LoopCounter && isa<ConstantInt>(I.getOperand(0))) {
+            MulInstFound = &I;
+            ConstFound   = cast<ConstantInt>(I.getOperand(0));
+            break;
+        }
+    }
+
+    if (!MulInstFound || !ConstFound) {
+        errs() << "No mul pattern found\n";
+        return;
+    }
+
+    MulFactor = ConstFound->getSExtValue();
+
+    auto *AllocaPtrTy = dyn_cast<PointerType>(LoopCounter->getType());
+    if (!AllocaPtrTy) {
+        errs() << "[LSR] LoopCounter is not a pointer to scalar, bailing\n";
+        return;
+    }
+
+    Type *IdxTy = nullptr;
+    if (auto *Alloca = dyn_cast<AllocaInst>(LoopCounter))
+      IdxTy = Alloca->getAllocatedType();
+    else
+      IdxTy = Type::getInt32Ty(L->getHeader()->getContext());
+    ConstantInt *StepConst = ConstantInt::get(cast<IntegerType>(IdxTy), MulFactor);
+
+    IRBuilder<> BPre(Preheader->getTerminator());
+
+    AllocaInst *IdxAlloca = BPre.CreateAlloca(IdxTy, nullptr, "Idx");
+
+    Value *InitIV = BPre.CreateLoad(IdxTy, LoopCounter, "iv.init");
+
+    Value *InitScaled = BPre.CreateMul(InitIV, StepConst, "idx.init");
+
+    BPre.CreateStore(InitScaled, IdxAlloca);
+
+    //replacing the mul instruction
+    IRBuilder<> BBody(MulInstFound);
+
+    Value *CurrIdxScaled =
+        BBody.CreateLoad(IdxTy, IdxAlloca, "idx.curr");
+
+    MulInstFound->replaceAllUsesWith(CurrIdxScaled);
+
+    MulInstFound->eraseFromParent();
+    
+
+    //updating idx value
+    Instruction *LatchTerm = Latch->getTerminator();
+    IRBuilder<> BL(LatchTerm);
+
+    Value *OldScaled = BL.CreateLoad(IdxTy, IdxAlloca, "idx.old");
+
+    Value *NewScaled = BL.CreateAdd(OldScaled, StepConst, "idx.next");
+
+    BL.CreateStore(NewScaled, IdxAlloca);
+
+    errs() << "Applied strength reduction\n";
+}
+
 
   bool runOnLoop(Loop *L, LPPassManager &LPM) override {
     mapVariables(L);
     LoopBasicBlocks = L->getBlocksVector();
+    findLoopCounterAndBound(L);
     if (canReduce()) {
-      errs() << "Wuhuuu 8 iz ppj!\n";
+      reduce(L);
+      errs() << "Reducing can be done!\n";
     }
     else {
-      errs() << "Wuhuuu 9 iz ppj!\n";
+      errs() << "No reducing needed!\n";
     }
     return true;
   }
-}; // end of struct OurLoopUnswitchingPass
-}  // end of anonymous namespace
+};
+}
 
 char OurLoopReduce::ID = 0;
 static RegisterPass<OurLoopReduce> X("our-loop-reduce", "",
