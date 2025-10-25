@@ -56,7 +56,7 @@ struct OurLoopReduce : public LoopPass {
     }
   }
 
-  bool canReduce()
+  bool canReduceSimpleMul()
   {
     BasicBlock * LoopBodyBB = LoopBasicBlocks[1]; // assuming there is only 1 BB
     if (LoopBodyBB == nullptr) {
@@ -88,7 +88,7 @@ struct OurLoopReduce : public LoopPass {
     return false;
   }
 
-  void reduce(Loop *L) {
+  void reduceSimpleMul(Loop *L) {
     using namespace llvm;
 
     BasicBlock *Preheader = L->getLoopPreheader();
@@ -147,7 +147,7 @@ struct OurLoopReduce : public LoopPass {
 
     auto *AllocaPtrTy = dyn_cast<PointerType>(LoopCounter->getType());
     if (!AllocaPtrTy) {
-        errs() << "[LSR] LoopCounter is not a pointer to scalar, bailing\n";
+        errs() << "LoopCounter is not a pointer to scalar\n";
         return;
     }
 
@@ -190,15 +190,136 @@ struct OurLoopReduce : public LoopPass {
     BL.CreateStore(NewScaled, IdxAlloca);
 
     errs() << "Applied strength reduction\n";
-}
+  }
 
+  bool canReducePointer()
+  {
+    BasicBlock * LoopBodyBB = LoopBasicBlocks[1]; // assuming there is only 1 BB
+    if (LoopBodyBB == nullptr) {
+      return false;
+    }
+
+    Value *Var;
+
+    for (Instruction &I : *LoopBodyBB) {
+      if (isa<GetElementPtrInst>(&I)) {
+        Var = VariablesMap[I.getOperand(2)];
+
+        if (Var == LoopCounter) {
+            return true;
+        }
+      }
+    }
+
+    return false;
+  }
+
+  void reducePointer(Loop *L) {
+    BasicBlock *Preheader = L->getLoopPreheader();
+    BasicBlock *Header = L->getHeader();
+    BasicBlock *Latch = L->getLoopLatch();
+
+    if (!Preheader || !Header || !Latch) {
+        errs() << "Loop shape unsupported\n";
+        return;
+    }
+
+    BasicBlock *BodyBB = nullptr;
+    for (BasicBlock *BB : L->getBlocks()) {
+        if (BB != Header && BB != Latch) {
+            BodyBB = BB;
+            break;
+        }
+    }
+    if (!BodyBB)
+        BodyBB = Header;
+
+    // Find pattern:
+    // %elem.ptr = getelementptr [N x i32], ptr %arr, i32 0, i64 %idx
+    // store i32 %val, ptr %elem.ptr
+    GetElementPtrInst *GEPInst = nullptr;
+    StoreInst *StoreAfterGEP = nullptr;
+
+    for (Instruction &I : *BodyBB) {
+      auto *G = dyn_cast<GetElementPtrInst>(&I);
+      if (!G) continue;
+
+      // Next instruction should store in that GEP
+      Instruction *Next = I.getNextNode();
+      if (!Next) continue;
+      auto *S = dyn_cast<StoreInst>(Next);
+      if (!S) continue;
+
+      if (S->getPointerOperand() != G)
+          continue;
+
+      if (G->getNumOperands() != 3)
+          continue;
+
+      auto *ZeroIdx = dyn_cast<ConstantInt>(G->getOperand(1));
+      if (!ZeroIdx || !ZeroIdx->isZero())
+          continue;
+
+      GEPInst = G;
+      StoreAfterGEP = S;
+      break;
+    }
+
+    if (!GEPInst || !StoreAfterGEP) {
+      errs() << "No suitable static-array GEP+store pattern found\n";
+      return;
+    }
+
+    Value *ArrayAllocaPtr = GEPInst->getOperand(0);
+    Value *StoreVal = StoreAfterGEP->getValueOperand();
+    Type *ElementTy = GEPInst->getResultElementType();
+
+    LLVMContext &Ctx = Header->getContext();
+    IRBuilder<> BPre(Preheader->getTerminator());
+
+    PointerType *ElementPtrTy = PointerType::getUnqual(ElementTy);
+    AllocaInst *PtrAlloca = BPre.CreateAlloca(ElementPtrTy, nullptr, "p");
+
+    // CreateGEP expects Value* as its arguments thus we make Zero32
+    Value *Zero32 = ConstantInt::get(Type::getInt32Ty(Ctx), 0);
+
+    Value *PInit = BPre.CreateGEP(GEPInst->getSourceElementType(), ArrayAllocaPtr, { Zero32, Zero32 }, "p.init");
+
+    BPre.CreateStore(PInit, PtrAlloca);
+
+    // Adding a new store
+    IRBuilder<> BBody(StoreAfterGEP);
+
+    Value *CurPtr = BBody.CreateLoad(ElementPtrTy, PtrAlloca, "p.cur");
+
+    BBody.CreateStore(StoreVal, CurPtr);
+
+    // removing old store and GEP instructions
+    StoreAfterGEP->eraseFromParent();
+    GEPInst->eraseFromParent();
+
+
+    // Incrementing pointer
+    Instruction *LatchTerm = Latch->getTerminator();
+    IRBuilder<> BL(LatchTerm);
+
+    Value *OldPtr = BL.CreateLoad(ElementPtrTy, PtrAlloca, "p.old");
+
+    // Same as for zeros, we have to make One32
+    Value *One32 = ConstantInt::get(Type::getInt32Ty(Ctx), 1);
+    Value *NextPtr = BL.CreateGEP(ElementTy, OldPtr, One32, "p.next");
+
+    BL.CreateStore(NextPtr, PtrAlloca);
+
+    errs() << "Applied pointer-based strength reduction\n";
+  }
 
   bool runOnLoop(Loop *L, LPPassManager &LPM) override {
     mapVariables(L);
     LoopBasicBlocks = L->getBlocksVector();
     findLoopCounterAndBound(L);
-    if (canReduce()) {
-      reduce(L);
+    if (canReducePointer()) {
+      reducePointer(L);
       errs() << "Reducing can be done!\n";
     }
     else {
