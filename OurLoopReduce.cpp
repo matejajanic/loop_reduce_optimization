@@ -26,7 +26,7 @@ struct OurLoopReduce : public LoopPass {
   std::unordered_map<Value *, Value *> VariablesMap;
   Value *LoopCounter, *LoopBound;
   bool isLoopBoundConst;
-  int BoundValue, MulFactor;
+  int BoundValue;
 
   static char ID; // Pass identification, replacement for typeid
   OurLoopReduce() : LoopPass(ID) {}
@@ -100,12 +100,7 @@ struct OurLoopReduce : public LoopPass {
         Var1 = VariablesMap[I.getOperand(0)];
         Var2 = VariablesMap[I.getOperand(1)];
 
-        if (Var1 == LoopCounter) {
-          MulFactor = Var2;
-          return true;
-        }
-        else if (Var2 == LoopCounter) {
-          MulFactor = Var1;
+        if (Var1 == LoopCounter || Var2 == LoopCounter) {
           return true;
         }
       }
@@ -380,8 +375,8 @@ struct OurLoopReduce : public LoopPass {
     mapVariables(L);
     LoopBasicBlocks = L->getBlocksVector();
     findLoopCounterAndBound(L);
-    if (canReducePointer()) {
-      reducePointer(L);
+    if (canReduceSimpleMul()) {
+      reduceSimpleMul(L);
       errs() << "Reducing can be done!\n";
     }
     else {
