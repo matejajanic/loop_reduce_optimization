@@ -20,6 +20,30 @@
 
 using namespace llvm;
 
+struct ScaledInductionInfo {
+  llvm::AllocaInst *IdxAlloca = nullptr;
+  llvm::Value      *AInit     = nullptr;
+  llvm::Value      *InitOffset= nullptr;
+
+  llvm::BasicBlock *Preheader = nullptr;
+  llvm::BasicBlock *Header    = nullptr;
+  llvm::BasicBlock *Latch     = nullptr;
+  llvm::BasicBlock *BodyBB    = nullptr;
+
+  bool Valid = false;
+
+  void reset() {
+    IdxAlloca   = nullptr;
+    AInit       = nullptr;
+    InitOffset  = nullptr;
+    Preheader   = nullptr;
+    Header      = nullptr;
+    Latch       = nullptr;
+    BodyBB      = nullptr;
+    Valid       = false;
+  }
+};
+
 namespace {
 struct OurLoopReduce : public LoopPass {
   std::vector<BasicBlock *> LoopBasicBlocks;
@@ -110,27 +134,28 @@ struct OurLoopReduce : public LoopPass {
   }
 
   void reduceSimpleMul(Loop *L) {
-    BasicBlock *Preheader = L->getLoopPreheader();
-    BasicBlock *Header = L->getHeader();
-    BasicBlock *Latch = L->getLoopLatch();
-    if (!Preheader || !Header || !Latch) {
+    ScaledInductionInfo Info;
+    Info.Preheader = L->getLoopPreheader();
+    Info.Header = L->getHeader();
+    Info.Latch = L->getLoopLatch();
+    if (!Info.Preheader || !Info.Header || !Info.Latch) {
         errs() << "Loop shape unsupported!\n";
         return;
     }
 
-    BasicBlock *BodyBB = nullptr;
+    Info.BodyBB = nullptr;
     for (BasicBlock *BB : L->getBlocks()) {
-        if (BB != Header && BB != Latch) {
-            BodyBB = BB;
+        if (BB != Info.Header && BB != Info.Latch) {
+            Info.BodyBB = BB;
             break;
         }
     }
-    if (!BodyBB)
-        BodyBB = Header;
+    if (!Info.BodyBB)
+        Info.BodyBB = Info.Header;
 
     Instruction *MulInstFound = nullptr;
     Value *MulFactorRaw = nullptr;
-    for (Instruction &I : *BodyBB) {
+    for (Instruction &I : Info.BodyBB) {
         if (I.getOpcode() != Instruction::Mul)
             continue;
 
@@ -206,14 +231,14 @@ struct OurLoopReduce : public LoopPass {
     if (auto *AllocaLC = dyn_cast<AllocaInst>(LoopCounter)) {
         IdxTy = AllocaLC->getAllocatedType();
     } else {
-        IdxTy = Type::getInt32Ty(Header->getContext());
+        IdxTy = Type::getInt32Ty(Info.Header->getContext());
     }
 
-    Function *F = Header->getParent();
+    Function *F = Info.Header->getParent();
     IRBuilder<> BEntry(&*F->getEntryBlock().getFirstInsertionPt());
     AllocaInst *IdxAlloca = BEntry.CreateAlloca(IdxTy, nullptr, "Idx");
 
-    IRBuilder<> BPre(Preheader->getTerminator());
+    IRBuilder<> BPre(Info.Preheader->getTerminator());
 
     Value *InitIV = BPre.CreateLoad(IdxTy, LoopCounter, "iv.init");
     if (!InitIV) {
@@ -252,11 +277,16 @@ struct OurLoopReduce : public LoopPass {
     if (MulInstFound->use_empty())
         MulInstFound->eraseFromParent();
 
-    Instruction *LatchTerm = Latch->getTerminator();
+    Instruction *LatchTerm = Info.Latch->getTerminator();
     IRBuilder<> BL(LatchTerm);
     Value *OldIdx = BL.CreateLoad(IdxTy, IdxAlloca, "idx.old");
     Value *NewIdx = BL.CreateAdd(OldIdx, AInit, "idx.next");
     BL.CreateStore(NewIdx, IdxAlloca);
+
+    Info.IdxAlloca = IdxAlloca;
+    Info.AInit = AInit;
+    Info.InitOffset = InitOffset;
+    Info.Valid = true;
 
     errs() << "Applied strength reduction\n";
   }
@@ -339,31 +369,54 @@ struct OurLoopReduce : public LoopPass {
       return;
     }
 
-    Value *ArrayAllocaPtr = GEPInst->getOperand(0);
+    Value *BasePtr = GEPInst->getPointerOperand();
     Value *StoreVal = StoreAfterGEP->getValueOperand();
     Type *ElementTy = GEPInst->getResultElementType();
 
+    Function *F = Header->getParent();
     LLVMContext &Ctx = Header->getContext();
-    IRBuilder<> BPre(Preheader->getTerminator());
-
+    IRBuilder<> BEntry(&*F->getEntryBlock().getFirstInsertionPt());
     PointerType *ElementPtrTy = PointerType::getUnqual(ElementTy);
-    AllocaInst *PtrAlloca = BPre.CreateAlloca(ElementPtrTy, nullptr, "p");
+    AllocaInst *PtrAlloca = BEntry.CreateAlloca(ElementPtrTy, nullptr, "p");
 
-    // CreateGEP expects Value* as its arguments thus we make Zero32
+    bool CanUseScaledInfo =
+       Info.Valid &&
+       Info.Preheader == Preheader &&
+       Info.Latch == Latch &&
+       Info.BodyBB == BodyBB;
+
+    if (CanUseScaledInfo) {
+      IRBuilder<> BPre(Preheader->getTerminator());
+
+      Value *PtrInit = BPre.CreateGEP(GEPInst->getSourceElementType(), BasePtr, Info.InitOffset, "p.init");
+
+      BPre.CreateStore(PtrInit, PtrAlloca);
+      IRBuilder<> BBody(StoreAfterGEP);
+      Value *CurPtr = BBody.CreateLoad(ElementPtrTy, PtrAlloca, "p.cur");
+      BBody.CreateStore(StoreVal, CurPtr);
+
+      StoreAfterGEP->eraseFromParent();
+      GEPInst->eraseFromParent();
+
+      IRBuilder<> BL(Latch->getTerminator());
+      Value *OldPtr = BL.CreateLoad(ElementPtrTy, PtrAlloca, "p.old");
+      Value *NextPtr = BL.CreateGEP(ElementTy, OldPtr, Info.AInit, "p.next");
+      BL.CreateStore(NextPtr, PtrAlloca);
+
+      errs() << "Applied pointer-based strength reduction (scaled a*i+b)\n";
+      return;
+    }
+
+    IRBuilder<> BPre(Preheader->getTerminator());
+    // we have to make a value for 0 because CreateGEP expects a Value* type
     Value *Zero32 = ConstantInt::get(Type::getInt32Ty(Ctx), 0);
-
-    Value *PInit = BPre.CreateGEP(GEPInst->getSourceElementType(), ArrayAllocaPtr, { Zero32, Zero32 }, "p.init");
-
+    Value *PInit = BPre.CreateGEP(GEPInst->getSourceElementType(), BasePtr, { Zero32, Zero32 }, "p.init");
     BPre.CreateStore(PInit, PtrAlloca);
 
-    // Adding a new store
     IRBuilder<> BBody(StoreAfterGEP);
-
     Value *CurPtr = BBody.CreateLoad(ElementPtrTy, PtrAlloca, "p.cur");
-
     BBody.CreateStore(StoreVal, CurPtr);
 
-    // removing old store and GEP instructions
     StoreAfterGEP->eraseFromParent();
     GEPInst->eraseFromParent();
 
@@ -380,20 +433,18 @@ struct OurLoopReduce : public LoopPass {
 
     BL.CreateStore(NextPtr, PtrAlloca);
 
-    errs() << "Applied pointer-based strength reduction\n";
+    errs() << "Applied pointer-based strength reduction (non scaled)\n";
+    return;
   }
 
   bool runOnLoop(Loop *L, LPPassManager &LPM) override {
     mapVariables(L);
     LoopBasicBlocks = L->getBlocksVector();
     findLoopCounterAndBound(L);
-    if (canReduceSimpleMul()) {
-      reduceSimpleMul(L);
-      errs() << "Reducing can be done!\n";
-    }
-    else {
-      errs() << "No reducing needed!\n";
-    }
+    if(canReduceSimpleMul)
+      reduceSimpleMul;
+    if(canReducePointer)
+      reducePointer;
     return true;
   }
 };
