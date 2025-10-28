@@ -96,21 +96,17 @@ struct OurLoopReduce : public LoopPass {
     Value *Var1, *Var2;
 
     for (Instruction &I : *LoopBodyBB) {
-      if (isa<MulOperator>(&I)) {
+      if (I.getOpcode() == Instruction::Mul) {
         Var1 = VariablesMap[I.getOperand(0)];
         Var2 = VariablesMap[I.getOperand(1)];
 
         if (Var1 == LoopCounter) {
-          if (ConstantInt *ConstInt = dyn_cast<ConstantInt>(I.getOperand(1))) {
-            MulFactor = ConstInt->getSExtValue();
-            return true;
-          }
+          MulFactor = Var2;
+          return true;
         }
         else if (Var2 == LoopCounter) {
-          if (ConstantInt *ConstInt = dyn_cast<ConstantInt>(I.getOperand(0))) {
-            MulFactor = ConstInt->getSExtValue();
-            return true;
-          }
+          MulFactor = Var1;
+          return true;
         }
       }
     }
@@ -119,12 +115,9 @@ struct OurLoopReduce : public LoopPass {
   }
 
   void reduceSimpleMul(Loop *L) {
-    using namespace llvm;
-
     BasicBlock *Preheader = L->getLoopPreheader();
     BasicBlock *Header = L->getHeader();
     BasicBlock *Latch = L->getLoopLatch();
-
     if (!Preheader || !Header || !Latch) {
         errs() << "Loop shape unsupported!\n";
         return;
@@ -140,10 +133,8 @@ struct OurLoopReduce : public LoopPass {
     if (!BodyBB)
         BodyBB = Header;
 
-    // finding the mul instruction
     Instruction *MulInstFound = nullptr;
-    ConstantInt *ConstFound   = nullptr;
-
+    Value *MulFactorRaw = nullptr;
     for (Instruction &I : *BodyBB) {
         if (I.getOpcode() != Instruction::Mul)
             continue;
@@ -151,76 +142,117 @@ struct OurLoopReduce : public LoopPass {
         Value *Op0 = I.getOperand(0);
         Value *Op1 = I.getOperand(1);
 
-        if (VariablesMap.find(Op0) != VariablesMap.end())
-            Op0 = VariablesMap[Op0];
-        if (VariablesMap.find(Op1) != VariablesMap.end())
-            Op1 = VariablesMap[Op1];
+        Value *NormedOp0 = VariablesMap.count(Op0) ? VariablesMap[Op0] : Op0;
+        Value *NormedOp1 = VariablesMap.count(Op1) ? VariablesMap[Op1] : Op1;
 
-        if (Op0 == LoopCounter && isa<ConstantInt>(I.getOperand(1))) {
+        if (NormedOp0 == LoopCounter) {
             MulInstFound = &I;
-            ConstFound   = cast<ConstantInt>(I.getOperand(1));
+            MulFactorRaw = Op1;
             break;
         }
-        if (Op1 == LoopCounter && isa<ConstantInt>(I.getOperand(0))) {
+        if (NormedOp1 == LoopCounter) {
             MulInstFound = &I;
-            ConstFound   = cast<ConstantInt>(I.getOperand(0));
+            MulFactorRaw = Op0;
             break;
         }
     }
 
-    if (!MulInstFound || !ConstFound) {
-        errs() << "No mul pattern found\n";
+    if (!MulInstFound || !MulFactorRaw) {
+        errs() << "No mul(i,a) pattern found\n";
         return;
     }
 
-    MulFactor = ConstFound->getSExtValue();
+    Instruction *AddInstFound = nullptr;
+    LoadInst *LoadOperand = nullptr;
+    for (User *U : MulInstFound->users()) {
+        Instruction *UserI = dyn_cast<Instruction>(U);
+        if (!UserI)
+            continue;
+        if (UserI->getOpcode() != Instruction::Add)
+            continue;
 
-    auto *AllocaPtrTy = dyn_cast<PointerType>(LoopCounter->getType());
-    if (!AllocaPtrTy) {
-        errs() << "LoopCounter is not a pointer to scalar\n";
+        Value *A0 = UserI->getOperand(0);
+        Value *A1 = UserI->getOperand(1);
+
+        if (A0 == MulInstFound) {
+            if (auto *Ld = dyn_cast<LoadInst>(A1)) {
+                AddInstFound = UserI;
+                LoadOperand = Ld;
+                break;
+            }
+        }
+        if (A1 == MulInstFound) {
+            if (auto *Ld = dyn_cast<LoadInst>(A0)) {
+                AddInstFound = UserI;
+                LoadOperand = Ld;
+                break;
+            }
+        }
+    }
+
+    if (!AddInstFound || !LoadOperand) {
+        errs() << "No mul, load, add pattern\n";
+        return;
+    }
+
+    Value *BPtr = LoadOperand->getPointerOperand();
+    if (!BPtr) {
+        errs() << "Load has no pointer operand\n";
         return;
     }
 
     Type *IdxTy = nullptr;
-    if (auto *Alloca = dyn_cast<AllocaInst>(LoopCounter))
-      IdxTy = Alloca->getAllocatedType();
-    else
-      IdxTy = Type::getInt32Ty(L->getHeader()->getContext());
-    ConstantInt *StepConst = ConstantInt::get(cast<IntegerType>(IdxTy), MulFactor);
+    if (auto *AllocaLC = dyn_cast<AllocaInst>(LoopCounter)) {
+        IdxTy = AllocaLC->getAllocatedType();
+    } else {
+        IdxTy = Type::getInt32Ty(Header->getContext());
+    }
+
+    Function *F = Header->getParent();
+    IRBuilder<> BEntry(&*F->getEntryBlock().getFirstInsertionPt());
+    AllocaInst *IdxAlloca = BEntry.CreateAlloca(IdxTy, nullptr, "Idx");
 
     IRBuilder<> BPre(Preheader->getTerminator());
 
-    AllocaInst *IdxAlloca = BPre.CreateAlloca(IdxTy, nullptr, "Idx");
-
     Value *InitIV = BPre.CreateLoad(IdxTy, LoopCounter, "iv.init");
+    if (!InitIV) {
+        errs() << "Can't get init IV\n";
+        return;
+    }
 
-    Value *InitScaled = BPre.CreateMul(InitIV, StepConst, "idx.init");
+    Value *AInit = nullptr;
+    if (auto *MFLoad = dyn_cast<LoadInst>(MulFactorRaw)) {
+        Value *APtr = MFLoad->getPointerOperand();
+        if (!APtr) {
+            errs() << "MulFactor load has no pointer operand\n";
+            return;
+        }
+        AInit = BPre.CreateLoad(IdxTy, APtr, "a.init");
+    } else {
+        AInit = MulFactorRaw;
+    }
 
-    BPre.CreateStore(InitScaled, IdxAlloca);
+    Value *InitB = BPre.CreateLoad(IdxTy, BPtr, "b.init");
+    Value *InitScaled = BPre.CreateMul(InitIV, AInit, "idx.init");
+    Value *InitOffset = BPre.CreateAdd(InitScaled, InitB, "idx.offset");
+    BPre.CreateStore(InitOffset, IdxAlloca);
 
-    //replacing the mul instruction
     IRBuilder<> BBody(MulInstFound);
+    Value *CurrIdx = BBody.CreateLoad(IdxTy, IdxAlloca, "idx.curr");
+    AddInstFound->replaceAllUsesWith(CurrIdx);
+    AddInstFound->eraseFromParent();
+    if (MulInstFound->use_empty())
+        MulInstFound->eraseFromParent();
 
-    Value *CurrIdxScaled =
-        BBody.CreateLoad(IdxTy, IdxAlloca, "idx.curr");
-
-    MulInstFound->replaceAllUsesWith(CurrIdxScaled);
-
-    MulInstFound->eraseFromParent();
-    
-
-    //updating idx value
     Instruction *LatchTerm = Latch->getTerminator();
     IRBuilder<> BL(LatchTerm);
-
-    Value *OldScaled = BL.CreateLoad(IdxTy, IdxAlloca, "idx.old");
-
-    Value *NewScaled = BL.CreateAdd(OldScaled, StepConst, "idx.next");
-
-    BL.CreateStore(NewScaled, IdxAlloca);
+    Value *OldIdx = BL.CreateLoad(IdxTy, IdxAlloca, "idx.old");
+    Value *NewIdx = BL.CreateAdd(OldIdx, AInit, "idx.next");
+    BL.CreateStore(NewIdx, IdxAlloca);
 
     errs() << "Applied strength reduction\n";
-  }
+}
+
 
   bool canReducePointer()
   {
