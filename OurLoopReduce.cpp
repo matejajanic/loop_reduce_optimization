@@ -33,19 +33,16 @@ struct OurLoopReduce : public LoopPass {
 
   Value *stripToBase(Value *V) {
     while (true) {
-      // Ako je neki cast (sext, zext, trunc, bitcast, itd.)
       if (auto *Cast = dyn_cast<CastInst>(V)) {
         V = Cast->getOperand(0);
         continue;
       }
 
-      // Ako je load, idi na pointer od kog load-uješ
       if (auto *LI = dyn_cast<LoadInst>(V)) {
         V = LI->getPointerOperand();
         continue;
       }
 
-      // Inače stani
       break;
     }
     return V;
@@ -96,11 +93,14 @@ struct OurLoopReduce : public LoopPass {
     Value *Var1, *Var2;
 
     for (Instruction &I : *LoopBodyBB) {
-      if (I.getOpcode() == Instruction::Mul) {
+      if (isa<MulOperator>(&I)) {
         Var1 = VariablesMap[I.getOperand(0)];
         Var2 = VariablesMap[I.getOperand(1)];
 
-        if (Var1 == LoopCounter || Var2 == LoopCounter) {
+        if (Var1 == LoopCounter) {
+          return true;
+        }
+        else if (Var2 == LoopCounter) {
           return true;
         }
       }
@@ -158,42 +158,48 @@ struct OurLoopReduce : public LoopPass {
     }
 
     Instruction *AddInstFound = nullptr;
-    LoadInst *LoadOperand = nullptr;
+    Value *BSourceRaw = nullptr;
+    LoadInst *BSourceLoad = nullptr;
     for (User *U : MulInstFound->users()) {
-        Instruction *UserI = dyn_cast<Instruction>(U);
-        if (!UserI)
-            continue;
-        if (UserI->getOpcode() != Instruction::Add)
-            continue;
+      Instruction *UserI = dyn_cast<Instruction>(U);
+      if (!UserI)
+          continue;
+      if (UserI->getOpcode() != Instruction::Add)
+          continue;
 
-        Value *A0 = UserI->getOperand(0);
-        Value *A1 = UserI->getOperand(1);
+      Value *A0 = UserI->getOperand(0);
+      Value *A1 = UserI->getOperand(1);
 
-        if (A0 == MulInstFound) {
-            if (auto *Ld = dyn_cast<LoadInst>(A1)) {
-                AddInstFound = UserI;
-                LoadOperand = Ld;
-                break;
-            }
-        }
-        if (A1 == MulInstFound) {
-            if (auto *Ld = dyn_cast<LoadInst>(A0)) {
-                AddInstFound = UserI;
-                LoadOperand = Ld;
-                break;
-            }
-        }
+      if (A0 == MulInstFound) {
+          AddInstFound = UserI;
+          BSourceRaw = A1;
+      }
+      else if (A1 == MulInstFound) {
+        AddInstFound = UserI;
+        BSourceRaw = A0;
+      } else {
+        continue;
+      }
+
+      if (auto *Ld = dyn_cast<LoadInst>(BSourceRaw)) {
+        BSourceLoad = Ld;
+      }
+
+      break;
     }
 
-    if (!AddInstFound || !LoadOperand) {
+    if (!AddInstFound || !BSourceRaw) {
         errs() << "No mul, load, add pattern\n";
         return;
     }
 
-    Value *BPtr = LoadOperand->getPointerOperand();
-    if (!BPtr) {
+    Value *BPtr = nullptr;
+    if (BSourceLoad) {
+      BPtr = BSourceLoad->getPointerOperand();
+      if (!BPtr) {
         errs() << "Load has no pointer operand\n";
         return;
+      }
     }
 
     Type *IdxTy = nullptr;
@@ -227,7 +233,14 @@ struct OurLoopReduce : public LoopPass {
         AInit = MulFactorRaw;
     }
 
-    Value *InitB = BPre.CreateLoad(IdxTy, BPtr, "b.init");
+    Value *InitB = nullptr;
+    if (BPtr) {
+      InitB = BPre.CreateLoad(IdxTy, BPtr, "b.init");
+    }
+    else {
+      InitB = BSourceRaw;
+    }
+
     Value *InitScaled = BPre.CreateMul(InitIV, AInit, "idx.init");
     Value *InitOffset = BPre.CreateAdd(InitScaled, InitB, "idx.offset");
     BPre.CreateStore(InitOffset, IdxAlloca);
@@ -246,8 +259,7 @@ struct OurLoopReduce : public LoopPass {
     BL.CreateStore(NewIdx, IdxAlloca);
 
     errs() << "Applied strength reduction\n";
-}
-
+  }
 
   bool canReducePointer()
   {
@@ -391,3 +403,4 @@ char OurLoopReduce::ID = 0;
 static RegisterPass<OurLoopReduce> X("our-loop-reduce", "",
                                               false /* Only looks at CFG */,
                                               false /* Analysis Pass */);
+
