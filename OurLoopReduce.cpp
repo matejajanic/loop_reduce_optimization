@@ -20,39 +20,43 @@
 
 using namespace llvm;
 
+namespace {
 struct ScaledInductionInfo {
-  llvm::AllocaInst *IdxAlloca = nullptr;
-  llvm::Value      *AInit     = nullptr;
-  llvm::Value      *InitOffset= nullptr;
+  AllocaInst *IdxAlloca = nullptr;
+  Value *AInit = nullptr;
+  Value *InitOffset = nullptr;
 
-  llvm::BasicBlock *Preheader = nullptr;
-  llvm::BasicBlock *Header    = nullptr;
-  llvm::BasicBlock *Latch     = nullptr;
-  llvm::BasicBlock *BodyBB    = nullptr;
+  BasicBlock *Preheader = nullptr;
+  BasicBlock *Header = nullptr;
+  BasicBlock *Latch = nullptr;
+  BasicBlock *BodyBB = nullptr;
 
   bool Valid = false;
+  bool HasAdd = true;
 
   void reset() {
-    IdxAlloca   = nullptr;
-    AInit       = nullptr;
-    InitOffset  = nullptr;
-    Preheader   = nullptr;
-    Header      = nullptr;
-    Latch       = nullptr;
-    BodyBB      = nullptr;
-    Valid       = false;
+    IdxAlloca = nullptr;
+    AInit = nullptr;
+    InitOffset = nullptr;
+    Preheader = nullptr;
+    Header = nullptr;
+    Latch = nullptr;
+    BodyBB = nullptr;
+    Valid = false;
+    HasAdd = true;
   }
 };
 
-namespace {
+
 struct OurLoopReduce : public LoopPass {
   std::vector<BasicBlock *> LoopBasicBlocks;
   std::unordered_map<Value *, Value *> VariablesMap;
-  Value *LoopCounter, *LoopBound;
+  Value *LoopCounter, *LoopBound, *BDef;
   bool isLoopBoundConst;
   int BoundValue;
 
-  static char ID; // Pass identification, replacement for typeid
+  ScaledInductionInfo Info;
+  static char ID;
   OurLoopReduce() : LoopPass(ID) {}
 
   Value *stripToBase(Value *V) {
@@ -134,7 +138,6 @@ struct OurLoopReduce : public LoopPass {
   }
 
   void reduceSimpleMul(Loop *L) {
-    ScaledInductionInfo Info;
     Info.Preheader = L->getLoopPreheader();
     Info.Header = L->getHeader();
     Info.Latch = L->getLoopLatch();
@@ -142,6 +145,9 @@ struct OurLoopReduce : public LoopPass {
         errs() << "Loop shape unsupported!\n";
         return;
     }
+
+    LLVMContext &DefCtx = Info.Header->getContext();
+    BDef = ConstantInt::get(Type::getInt32Ty(DefCtx), 0);
 
     Info.BodyBB = nullptr;
     for (BasicBlock *BB : L->getBlocks()) {
@@ -155,7 +161,7 @@ struct OurLoopReduce : public LoopPass {
 
     Instruction *MulInstFound = nullptr;
     Value *MulFactorRaw = nullptr;
-    for (Instruction &I : Info.BodyBB) {
+    for (Instruction &I : *Info.BodyBB) {
         if (I.getOpcode() != Instruction::Mul)
             continue;
 
@@ -188,16 +194,16 @@ struct OurLoopReduce : public LoopPass {
     for (User *U : MulInstFound->users()) {
       Instruction *UserI = dyn_cast<Instruction>(U);
       if (!UserI)
-          continue;
+        continue;
       if (UserI->getOpcode() != Instruction::Add)
-          continue;
+        continue;
 
       Value *A0 = UserI->getOperand(0);
       Value *A1 = UserI->getOperand(1);
 
       if (A0 == MulInstFound) {
-          AddInstFound = UserI;
-          BSourceRaw = A1;
+        AddInstFound = UserI;
+        BSourceRaw = A1;
       }
       else if (A1 == MulInstFound) {
         AddInstFound = UserI;
@@ -213,9 +219,10 @@ struct OurLoopReduce : public LoopPass {
       break;
     }
 
-    if (!AddInstFound || !BSourceRaw) {
-        errs() << "No mul, load, add pattern\n";
-        return;
+    if (!AddInstFound) {
+      BSourceRaw = BDef;
+      BSourceLoad = nullptr;
+      Info.HasAdd = false;
     }
 
     Value *BPtr = nullptr;
@@ -229,9 +236,9 @@ struct OurLoopReduce : public LoopPass {
 
     Type *IdxTy = nullptr;
     if (auto *AllocaLC = dyn_cast<AllocaInst>(LoopCounter)) {
-        IdxTy = AllocaLC->getAllocatedType();
+      IdxTy = AllocaLC->getAllocatedType();
     } else {
-        IdxTy = Type::getInt32Ty(Info.Header->getContext());
+      IdxTy = Type::getInt32Ty(Info.Header->getContext());
     }
 
     Function *F = Info.Header->getParent();
@@ -242,20 +249,20 @@ struct OurLoopReduce : public LoopPass {
 
     Value *InitIV = BPre.CreateLoad(IdxTy, LoopCounter, "iv.init");
     if (!InitIV) {
-        errs() << "Can't get init IV\n";
-        return;
+      errs() << "Can't get init IV\n";
+      return;
     }
 
     Value *AInit = nullptr;
     if (auto *MFLoad = dyn_cast<LoadInst>(MulFactorRaw)) {
-        Value *APtr = MFLoad->getPointerOperand();
-        if (!APtr) {
-            errs() << "MulFactor load has no pointer operand\n";
-            return;
-        }
-        AInit = BPre.CreateLoad(IdxTy, APtr, "a.init");
+      Value *APtr = MFLoad->getPointerOperand();
+      if (!APtr) {
+          errs() << "MulFactor load has no pointer operand\n";
+          return;
+      }
+      AInit = BPre.CreateLoad(IdxTy, APtr, "a.init");
     } else {
-        AInit = MulFactorRaw;
+      AInit = MulFactorRaw;
     }
 
     Value *InitB = nullptr;
@@ -272,10 +279,13 @@ struct OurLoopReduce : public LoopPass {
 
     IRBuilder<> BBody(MulInstFound);
     Value *CurrIdx = BBody.CreateLoad(IdxTy, IdxAlloca, "idx.curr");
-    AddInstFound->replaceAllUsesWith(CurrIdx);
-    AddInstFound->eraseFromParent();
+    if (Info.HasAdd) {
+      AddInstFound->replaceAllUsesWith(CurrIdx);
+      AddInstFound->eraseFromParent();
+    }
+
     if (MulInstFound->use_empty())
-        MulInstFound->eraseFromParent();
+      MulInstFound->eraseFromParent();
 
     Instruction *LatchTerm = Info.Latch->getTerminator();
     IRBuilder<> BL(LatchTerm);
@@ -291,23 +301,110 @@ struct OurLoopReduce : public LoopPass {
     errs() << "Applied strength reduction\n";
   }
 
-  bool canReducePointer()
-  {
-    BasicBlock * LoopBodyBB = LoopBasicBlocks[1]; // assuming there is only 1 BB
-    if (LoopBodyBB == nullptr) {
-      return false;
+  Value *normalizeToBase(Value *V) {
+    while (true) {
+      if (auto *Cast = dyn_cast<CastInst>(V)) {
+        V = Cast->getOperand(0);
+        continue;
+      }
+      break;
+    }
+    if (VariablesMap.count(V))
+      return VariablesMap[V];
+    return V;
+  }
+
+  bool isSameInduction(Value *V) {
+    V = normalizeToBase(V);
+    Value *Norm = V;
+    if (VariablesMap.count(V))
+      Norm = VariablesMap[V];
+    return Norm == LoopCounter;
+  };
+
+  bool isLinearIndexInLoop(Value *Idx) {
+    Idx = normalizeToBase(Idx);
+    if (isSameInduction(Idx))
+      return true;
+
+    if (auto *BO = dyn_cast<BinaryOperator>(Idx)) {
+      unsigned Opc = BO->getOpcode();
+
+      if (Opc == Instruction::Mul) {
+        Value *A = normalizeToBase(BO->getOperand(0));
+        Value *B = normalizeToBase(BO->getOperand(1));
+
+        // i * a  or  a * i
+        if (isSameInduction(A) && !isSameInduction(B))
+          return true;
+        if (isSameInduction(B) && !isSameInduction(A))
+          return true;
+        return false;
+      }
+
+      if (Opc == Instruction::Add) {
+        Value *A = BO->getOperand(0);
+        Value *B = BO->getOperand(1);
+
+        // linear_expr_i + invariant
+        if (isLinearIndexInLoop(A) && !isSameInduction(B))
+          return true;
+        if (isLinearIndexInLoop(B) && !isSameInduction(A))
+          return true;
+        return false;
+      }
     }
 
-    Value *Var;
+    return false;
+  };
 
-    for (Instruction &I : *LoopBodyBB) {
-      if (isa<GetElementPtrInst>(&I)) {
-        Var = VariablesMap[I.getOperand(2)];
+  bool canReducePointer(Loop *L) {
+    BasicBlock *Header = L->getHeader();
+    BasicBlock *Latch = L->getLoopLatch();
 
-        if (Var == LoopCounter) {
-            return true;
-        }
+    BasicBlock *BodyBB = nullptr;
+    for (BasicBlock *BB : L->getBlocks()) {
+      if (BB != Header && BB != Latch) {
+        BodyBB = BB;
+        break;
       }
+    }
+    if (!BodyBB)
+      BodyBB = Header;
+
+    if (!BodyBB)
+      return false;
+
+    // Sad iteriramo kroz telo tražeći GEP i gledamo index operand
+    for (Instruction &I : *BodyBB) {
+      auto *G = dyn_cast<GetElementPtrInst>(&I);
+      if (!G)
+        continue;
+
+        // heuristika: uzmi poslednji indeks GEP-a kao element index
+        // (za 1D ili arr[i] stil, to je obično operand 2 ili 3 itd.)
+        if (G->getNumOperands() < 2)
+          continue;
+
+        Value *IdxOperand = G->getOperand(G->getNumOperands() - 1);
+
+        // mora da bude naš lin. izraz po i
+        if (!isLinearIndexInLoop(IdxOperand))
+          continue;
+
+        // plus, mora da postoji store odmah posle koji koristi taj GEP (kao ranije)
+        Instruction *Next = I.getNextNode();
+        if (!Next)
+          continue;
+        auto *S = dyn_cast<StoreInst>(Next);
+        if (!S)
+          continue;
+        if (S->getPointerOperand() != G)
+          continue;
+
+        // ako smo stigli ovde: imamo GEP indeksiran linearnom funkcijom po i,
+        // i taj GEP se koristi odmah za store
+        return true;
     }
 
     return false;
@@ -319,19 +416,19 @@ struct OurLoopReduce : public LoopPass {
     BasicBlock *Latch = L->getLoopLatch();
 
     if (!Preheader || !Header || !Latch) {
-        errs() << "Loop shape unsupported\n";
-        return;
+      errs() << "Loop shape unsupported\n";
+      return;
     }
 
     BasicBlock *BodyBB = nullptr;
     for (BasicBlock *BB : L->getBlocks()) {
-        if (BB != Header && BB != Latch) {
-            BodyBB = BB;
-            break;
-        }
+      if (BB != Header && BB != Latch) {
+        BodyBB = BB;
+        break;
+      }
     }
     if (!BodyBB)
-        BodyBB = Header;
+      BodyBB = Header;
 
     // Find pattern:
     // %elem.ptr = getelementptr [N x i32], ptr %arr, i32 0, i64 %idx
@@ -350,14 +447,14 @@ struct OurLoopReduce : public LoopPass {
       if (!S) continue;
 
       if (S->getPointerOperand() != G)
-          continue;
+        continue;
 
       if (G->getNumOperands() != 3)
-          continue;
+        continue;
 
       auto *ZeroIdx = dyn_cast<ConstantInt>(G->getOperand(1));
       if (!ZeroIdx || !ZeroIdx->isZero())
-          continue;
+        continue;
 
       GEPInst = G;
       StoreAfterGEP = S;
@@ -403,12 +500,16 @@ struct OurLoopReduce : public LoopPass {
       Value *NextPtr = BL.CreateGEP(ElementTy, OldPtr, Info.AInit, "p.next");
       BL.CreateStore(NextPtr, PtrAlloca);
 
-      errs() << "Applied pointer-based strength reduction (scaled a*i+b)\n";
+      if (Info.HasAdd)
+        errs() << "Applied pointer-based strength reduction (scaled a*i+b)\n";
+      else
+        errs() << "Applied pointer-based strength reduction (scaled a*i)\n";
       return;
     }
 
     IRBuilder<> BPre(Preheader->getTerminator());
-    // we have to make a value for 0 because CreateGEP expects a Value* type
+
+    // CreateGEP expects Value* as its arguments thus we make Zero32
     Value *Zero32 = ConstantInt::get(Type::getInt32Ty(Ctx), 0);
     Value *PInit = BPre.CreateGEP(GEPInst->getSourceElementType(), BasePtr, { Zero32, Zero32 }, "p.init");
     BPre.CreateStore(PInit, PtrAlloca);
@@ -441,10 +542,20 @@ struct OurLoopReduce : public LoopPass {
     mapVariables(L);
     LoopBasicBlocks = L->getBlocksVector();
     findLoopCounterAndBound(L);
-    if(canReduceSimpleMul)
-      reduceSimpleMul;
-    if(canReducePointer)
-      reducePointer;
+    Info.reset();
+
+
+    if (canReducePointer(L)) {
+      errs() << "Moze i to\n";
+      if (canReduceSimpleMul())
+        reduceSimpleMul(L);
+
+      reducePointer(L);
+    }
+    else if (canReduceSimpleMul()){
+      reduceSimpleMul(L);
+    }
+
     return true;
   }
 };
