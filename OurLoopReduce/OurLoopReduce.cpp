@@ -546,7 +546,6 @@ struct OurLoopReduce : public LoopPass {
 
 
     if (canReducePointer(L)) {
-      errs() << "Moze i to\n";
       if (canReduceSimpleMul())
         reduceSimpleMul(L);
 
